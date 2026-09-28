@@ -1,5 +1,5 @@
 # Flask 用户服务镜像
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # 设置时区，避免日志时间错乱
 ENV TZ=Asia/Shanghai
