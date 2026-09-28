@@ -66,8 +66,12 @@ def create_app() -> Flask:
             get_redis().ping()
         except Exception as e:  # noqa: BLE001
             app.logger.warning("Redis 连接失败：%s", e)
-
-    @app.post("/register")
+    
+    @app.get("/api/health")
+    def health():
+        return jsonify(ok=True, service="python-api")
+    
+    @app.post("/api/register")
     def register():
         data = request.get_json(silent=True) or {}
         username = data.get("username", "").strip()
@@ -89,7 +93,7 @@ def create_app() -> Flask:
 
         return jsonify(code=201, msg="注册成功", data=user.to_dict()), 201
 
-    @app.post("/login")
+    @app.post("/api/login")
     def login():
         data = request.get_json(silent=True) or {}
         account = data.get("account", "").strip()
@@ -116,7 +120,7 @@ def create_app() -> Flask:
             },
         )
 
-    @app.get("/user")
+    @app.get("/api/user")
     def user_info():
         token = extract_token()
         user = resolve_user_from_token(token)
@@ -125,7 +129,7 @@ def create_app() -> Flask:
 
         return jsonify(code=200, msg="ok", data=user.to_dict())
 
-    @app.post("/logout")
+    @app.post("/api/logout")
     def logout():
         token = extract_token()
         if not token:
@@ -133,7 +137,7 @@ def create_app() -> Flask:
         revoke_token(token)
         return jsonify(code=200, msg="已退出登录")
 
-    @app.post("/ocr")
+    @app.post("/api/ocr")
     def ocr_recognize():
         # 需要登录
         user = current_user()
@@ -187,7 +191,7 @@ def create_app() -> Flask:
             },
         )
 
-    @app.get("/uploads/<path:filename>")
+    @app.get("/api/uploads/<path:filename>")
     def serve_upload(filename):
         """提供上传图片的访问。"""
         return send_from_directory(
