@@ -47,5 +47,19 @@ class Config:
     UPLOAD_FOLDER = "uploads"
     # 允许的图片扩展名
     ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "tiff"}
-    # 单文件最大 10MB
-    MAX_CONTENT_LENGTH = 10 * 1024 * 1024
+    # 单文件最大 20MB（同时覆盖 Google Vision /api/ocr 与 TextIn /api/v1/ocr/extract）
+    MAX_CONTENT_LENGTH = 20 * 1024 * 1024
+
+    # ---------- TextIn OCR provider (/api/v1/ocr/*) ----------
+    TEXTIN_APP_ID = os.getenv("TEXTIN_APP_ID", "")
+    TEXTIN_SECRET_CODE = os.getenv("TEXTIN_SECRET_CODE", "")
+    TEXTIN_ENDPOINT = os.getenv(
+        "TEXTIN_ENDPOINT", "https://api.textin.com/api/v1/xparse/parse/sync"
+    )
+    TEXTIN_EXTRACT_ENDPOINT = os.getenv(
+        "TEXTIN_EXTRACT_ENDPOINT", "https://api.textin.com/api/xparse/extract/sync"
+    )
+    OCR_STORAGE_DIR = os.getenv("OCR_STORAGE_DIR", "./temp/extractions")
+    OCR_UPLOADS_DIR = os.getenv("OCR_UPLOADS_DIR", "./temp/uploads")
+    TEXTIN_TIMEOUT_SECONDS = float(os.getenv("TEXTIN_TIMEOUT_SECONDS", "60"))
+    TEXTIN_CONNECT_TIMEOUT_SECONDS = float(os.getenv("TEXTIN_CONNECT_TIMEOUT_SECONDS", "10"))

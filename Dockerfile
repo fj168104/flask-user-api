@@ -17,13 +17,17 @@ RUN pip install --no-cache-dir \
 
 # 复制应用代码
 COPY app.py config.py extensions.py models.py auth.py ocr.py ./
+# TextIn OCR provider（/api/v1/ocr/*）
+COPY textin ./textin
 
 # 暴露端口
 EXPOSE 5000
 
-# 上传图片持久化目录（运行时挂载 volume）
-RUN mkdir -p /app/uploads
-VOLUME ["/app/uploads"]
+# 持久化目录（运行时挂载 volume）
+#   /app/uploads  — Google Vision 上传图片
+#   /app/temp     — TextIn OCR 抽取记录 + 原始上传文件
+RUN mkdir -p /app/uploads /app/temp/extractions /app/temp/uploads
+VOLUME ["/app/uploads", "/app/temp"]
 
 # 用 gunicorn 生产级 WSGI 启动
 # app:app => 模块 app.py 中的 Flask 实例 app

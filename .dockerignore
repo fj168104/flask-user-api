@@ -7,8 +7,14 @@ __pycache__/
 .gitignore
 *.db
 *.sqlite3
+.pytest_cache/
+.venv/
 # 上传的图片（运行时数据，不进镜像）
 uploads/
+# TextIn OCR 抽取记录 + 原始文件（运行时数据，不进镜像）
+temp/
+# 测试代码不进镜像
+tests/
 # 临时/一次性脚本，不进镜像
 setup_db.py
 debug_redis.py

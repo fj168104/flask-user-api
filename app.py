@@ -19,8 +19,9 @@ import os
 import uuid
 
 from flask import Flask, jsonify, request, send_from_directory
+from werkzeug.exceptions import RequestEntityTooLarge
 from config import Config
-from extensions import db, init_redis, get_redis
+from extensions import db, init_redis, get_redis, init_textin
 from models import User
 from auth import generate_token, resolve_user_from_token, revoke_token
 
@@ -54,6 +55,21 @@ def create_app() -> Flask:
 
     db.init_app(app)
     init_redis(app.config)
+    init_textin(app)
+
+    # 注册 TextIn OCR provider（/api/v1/ocr/*；无鉴权，独立存储）
+    from textin.routes import ocr_bp
+
+    app.register_blueprint(ocr_bp, url_prefix="/api/v1/ocr")
+
+    # 全局 413：超过 MAX_CONTENT_LENGTH 时统一返回 {code,msg,data} 信封
+    @app.errorhandler(RequestEntityTooLarge)
+    def _request_too_large(_):
+        max_bytes = app.config.get("MAX_CONTENT_LENGTH", 0)
+        return (
+            jsonify(code=413, msg=f"文件超过 {max_bytes} 字节上限", data=None),
+            413,
+        )
 
     # 确保上传目录存在
     upload_folder = app.config["UPLOAD_FOLDER"]
