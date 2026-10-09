@@ -51,8 +51,8 @@ class Config:
     MAX_CONTENT_LENGTH = 20 * 1024 * 1024
 
     # ---------- TextIn OCR provider (/api/v1/ocr/*) ----------
-    TEXTIN_APP_ID = os.getenv("TEXTIN_APP_ID", "")
-    TEXTIN_SECRET_CODE = os.getenv("TEXTIN_SECRET_CODE", "")
+    TEXTIN_APP_ID = os.getenv("TEXTIN_APP_ID", "4a8a32165b164e4fef6f2e54336de2d7")
+    TEXTIN_SECRET_CODE = os.getenv("TEXTIN_SECRET_CODE", "eac1b93270d3c7b9b7641c89309bb444")
     TEXTIN_ENDPOINT = os.getenv(
         "TEXTIN_ENDPOINT", "https://api.textin.com/api/v1/xparse/parse/sync"
     )
