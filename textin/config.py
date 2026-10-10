@@ -28,11 +28,7 @@ class TextInSettings(BaseSettings):
     textin_app_id: str = Field(default="", description="TextIn 应用 ID，传给 x-ti-app-id")
     textin_secret_code: str = Field(default="", description="TextIn 密钥，传给 x-ti-secret-code")
     textin_endpoint: str = "https://api.textin.com/api/v1/xparse/parse/sync"
-    textin_extract_endpoint: str = "https://api.textin.com/api/xparse/extract/sync"
-    textin_async_endpoint: str = "https://api.textin.com/api/v1/xparse/parse/async"
-    textin_async_status_endpoint: str = (
-        "https://api.textin.com/api/v1/xparse/parse/async/{job_id}"
-    )
+    textin_extract_endpoint: str = "https://api.textin.com/api/v1/xparse/extract/sync"
     ocr_storage_dir: Path = Path("./temp/extractions")
     ocr_uploads_dir: Path = Path("./temp/uploads")
     max_upload_bytes: int = 20 * 1024 * 1024
@@ -70,15 +66,7 @@ def build_textin_settings(app_config: Mapping[str, Any]) -> TextInSettings:
         "textin_endpoint": ("TEXTIN_ENDPOINT", "https://api.textin.com/api/v1/xparse/parse/sync"),
         "textin_extract_endpoint": (
             "TEXTIN_EXTRACT_ENDPOINT",
-            "https://api.textin.com/api/xparse/extract/sync",
-        ),
-        "textin_async_endpoint": (
-            "TEXTIN_ASYNC_ENDPOINT",
-            "https://api.textin.com/api/v1/xparse/parse/async",
-        ),
-        "textin_async_status_endpoint": (
-            "TEXTIN_ASYNC_STATUS_ENDPOINT",
-            "https://api.textin.com/api/v1/xparse/parse/async/{job_id}",
+            "https://api.textin.com/api/v1/xparse/extract/sync",
         ),
         "ocr_storage_dir": ("OCR_STORAGE_DIR", "./temp/extractions"),
         "ocr_uploads_dir": ("OCR_UPLOADS_DIR", "./temp/uploads"),

@@ -144,7 +144,7 @@ def settings() -> TextInSettings:
         textin_app_id="test_app_id",
         textin_secret_code="test_secret_code",
         textin_endpoint="https://api.textin.com/api/v1/xparse/parse/sync",
-        textin_extract_endpoint="https://api.textin.com/api/xparse/extract/sync",
+        textin_extract_endpoint="https://api.textin.com/api/v1/xparse/extract/sync",
     )
 
 

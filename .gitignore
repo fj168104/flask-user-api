@@ -10,7 +10,7 @@ __pycache__/
 *.db
 *.sqlite3
 
-# 运行时数据（Google Vision 上传 + TextIn 抽取记录）
+# 运行时数据（TextIn 抽取记录 + 原始上传文件）
 uploads/
 temp/
 .pytest_cache/
