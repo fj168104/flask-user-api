@@ -8,10 +8,11 @@ ENV TZ=Asia/Shanghai
 WORKDIR /app
 
 # 先装依赖（利用 Docker 层缓存：代码变动不会重新装包）
-# 用腾讯云内网镜像加速（也可换清华 https://pypi.tuna.tsinghua.edu.cn/simple）
+# 默认走官方 PyPI（Google Cloud Build 访问不了腾讯云/清华镜像）；国内本地构建可加 --build-arg PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+ARG PIP_INDEX_URL=https://pypi.org/simple
 COPY requirements.txt .
 RUN pip install --no-cache-dir \
-    -i https://mirrors.cloud.tencent.com/pypi/simple \
+    --index-url ${PIP_INDEX_URL} \
     --timeout 120 --retries 5 \
     -r requirements.txt
 
