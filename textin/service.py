@@ -23,12 +23,17 @@ from uuid import uuid4
 
 from textin.client import TextInClient, parse_extracted_schema
 from textin.config import TextInSettings
-from textin.errors import ExtractionNotFound, RecordParseError, UploadedFileNotFound
+from textin.errors import (
+    ExtractionNotFound,
+    RecordParseError,
+    TextInAPIError,
+    UploadedFileNotFound,
+)
 from textin.field_extractor import extract_fields
 from textin.schemas import (
-    ExtractSummary,
     ExtractionListItem,
     ExtractionRecord,
+    ExtractionStatus,
     SourceType,
 )
 
@@ -136,6 +141,9 @@ def _write_record(
     textin_response: dict[str, Any],
     fields: list[dict[str, Any]],
     field_source: FieldSource,
+    *,
+    status: ExtractionStatus = "success",
+    async_job_id: str | None = None,
 ) -> Path:
     record = {
         "extraction_id": extraction_id,
@@ -146,12 +154,27 @@ def _write_record(
         "textin_response": textin_response,
         "fields": fields,
         "field_source": field_source,
+        "status": status,
+        "async_job_id": async_job_id,
     }
     path = _storage_path(storage_dir, extraction_id)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def _read_record(storage_dir: Path, extraction_id: str) -> dict[str, Any]:
+    """读取原始落盘记录 dict；不存在或损坏抛对应异常。"""
+    if not is_valid_extraction_id(extraction_id):
+        raise ExtractionNotFound(extraction_id)
+    path = _storage_path(storage_dir, extraction_id)
+    if not path.exists():
+        raise ExtractionNotFound(extraction_id)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RecordParseError(str(e)) from e
 
 
 def _load_record_fields(data: dict[str, Any]) -> tuple[list[dict[str, Any]], FieldSource]:
@@ -281,6 +304,7 @@ def list_extractions(settings: TextInSettings) -> list[ExtractionListItem]:
                 page_count=summary["page_count"],
                 item_count=summary["item_count"],
                 field_count=summary["field_count"],
+                status=data.get("status", "success"),
             )
         )
     items.sort(key=lambda x: x.created_at, reverse=True)
@@ -289,15 +313,7 @@ def list_extractions(settings: TextInSettings) -> list[ExtractionListItem]:
 
 def get_extraction(settings: TextInSettings, extraction_id: str) -> ExtractionRecord:
     """读取单条完整记录；不存在时抛 ExtractionNotFound。"""
-    if not is_valid_extraction_id(extraction_id):
-        raise ExtractionNotFound(extraction_id)
-    path = _storage_path(settings.ocr_storage_dir, extraction_id)
-    if not path.exists():
-        raise ExtractionNotFound(extraction_id)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        raise RecordParseError(str(e)) from e
+    data = _read_record(settings.ocr_storage_dir, extraction_id)
     fields, _ = _load_record_fields(data)
     return ExtractionRecord(
         extraction_id=data["extraction_id"],
@@ -307,4 +323,142 @@ def get_extraction(settings: TextInSettings, extraction_id: str) -> ExtractionRe
         params=data.get("params") or {},
         textin_response=data["textin_response"],
         fields=fields,
+        status=data.get("status", "success"),
+        async_job_id=data.get("async_job_id"),
     )
+
+
+# ---------- async (TextIn /xparse/parse/async) ----------
+
+
+def submit_async_job(
+    settings: TextInSettings,
+    client: TextInClient,
+    filename: str,
+    file_bytes: bytes,
+    content_type: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """提交异步抽取任务 → 落盘 pending 记录 → 返回 {extraction_id, job_id, status}。
+
+    TextIn 异步端点不支持 schema 抽取（也不支持 file_url），所以只接受文件。
+    """
+    params = params or {}
+    textin_response = client.submit_async(filename, file_bytes, content_type, params)
+    job_id = textin_response.get("job_id")
+    if not job_id:
+        # 极端情况：TextIn 返回 200 但 data 没有 job_id
+        raise TextInAPIError(-1, "TextIn 异步提交未返回 job_id")
+
+    extraction_id = str(uuid4())
+    _save_uploaded_file(
+        settings.ocr_uploads_dir,
+        extraction_id,
+        file_bytes,
+        content_type,
+        filename,
+    )
+    _write_record(
+        settings.ocr_storage_dir,
+        extraction_id,
+        "file",
+        filename,
+        params,
+        textin_response={},
+        fields=[],
+        field_source="heuristic",
+        status="pending",
+        async_job_id=job_id,
+    )
+    logger.info(
+        "Async OCR submitted: extraction_id=%s job_id=%s filename=%s",
+        extraction_id,
+        job_id,
+        filename,
+    )
+    return {
+        "extraction_id": extraction_id,
+        "job_id": job_id,
+        "status": "pending",
+    }
+
+
+def _build_extraction_record(data: dict[str, Any]) -> ExtractionRecord:
+    fields, _ = _load_record_fields(data)
+    return ExtractionRecord(
+        extraction_id=data["extraction_id"],
+        source_type=data["source_type"],
+        source_ref=data["source_ref"],
+        created_at=datetime.fromisoformat(data["created_at"]),
+        params=data.get("params") or {},
+        textin_response=data["textin_response"],
+        fields=fields,
+        status=data.get("status", "success"),
+        async_job_id=data.get("async_job_id"),
+    )
+
+
+def poll_async_status(
+    settings: TextInSettings,
+    client: TextInClient,
+    extraction_id: str,
+) -> dict[str, Any]:
+    """查询异步任务状态：调 TextIn → 若 completed 拉取 result_url → 落盘更新。
+
+    返回 {status, record?, message?}：record 仅在 completed 时存在。
+    """
+    data = _read_record(settings.ocr_storage_dir, extraction_id)
+    job_id = data.get("async_job_id")
+    if not job_id:
+        # 不是异步记录，告知调用方
+        return {
+            "status": data.get("status", "success"),
+            "record": _build_extraction_record(data).model_dump(mode="json"),
+            "message": "该记录非异步任务",
+        }
+
+    status_resp = client.get_async_status(job_id)
+    upstream_status = status_resp.get("status") or "in_progress"
+
+    if upstream_status == "completed":
+        result_url = status_resp.get("result_url")
+        if not result_url:
+            raise TextInAPIError(-1, "TextIn 异步结果缺少 result_url")
+        textin_response = client.fetch_async_result(result_url)
+        fields = extract_fields(textin_response)
+        _write_record(
+            settings.ocr_storage_dir,
+            extraction_id,
+            data["source_type"],
+            data["source_ref"],
+            data.get("params") or {},
+            textin_response,
+            fields,
+            "heuristic",
+            status="completed",
+            async_job_id=job_id,
+        )
+        record = _build_extraction_record(_read_record(settings.ocr_storage_dir, extraction_id))
+        return {
+            "status": "completed",
+            "record": record.model_dump(mode="json"),
+        }
+
+    if upstream_status == "failed":
+        message = status_resp.get("message") or "TextIn 异步任务失败"
+        _write_record(
+            settings.ocr_storage_dir,
+            extraction_id,
+            data["source_type"],
+            data["source_ref"],
+            data.get("params") or {},
+            data.get("textin_response") or {},
+            data.get("fields") or [],
+            data.get("field_source") or "heuristic",
+            status="failed",
+            async_job_id=job_id,
+        )
+        return {"status": "failed", "message": message}
+
+    # pending / in_progress：原样转发，本地记录不动
+    return {"status": upstream_status}
