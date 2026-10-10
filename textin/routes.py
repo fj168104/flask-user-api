@@ -31,7 +31,9 @@ from textin.service import (
     get_extraction,
     is_valid_extraction_id,
     list_extractions,
+    poll_async_status,
     run_extraction,
+    submit_async_job,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,3 +225,84 @@ def get_extraction_file_route(extraction_id: str):
     response = Response(content, mimetype=content_type or "application/octet-stream")
     response.headers["Content-Disposition"] = f'inline; filename="{path.name}"'
     return response
+
+
+# ---------- async ----------
+
+
+def _parse_async_params() -> dict[str, Any]:
+    """解析异步接口的 parse_* / table / formula / rotate / page / page_count。"""
+    params: dict[str, Any] = {}
+    try:
+        for k, parser in (
+            ("parse_mode", lambda v: v if v else None),
+            ("language", lambda v: v if v else None),
+            ("table", _parse_bool),
+            ("formula", _parse_bool),
+            ("rotate", _parse_bool),
+            ("page", _parse_int),
+            ("page_count", _parse_int),
+        ):
+            raw = request.form.get(k)
+            if raw is not None and raw != "":
+                val = parser(raw)
+                if val is not None:
+                    params[k] = val
+    except OcrHTTPError:
+        raise
+    except Exception:  # noqa: BLE001
+        raise _fail(422, "validation_failed", "参数解析失败")
+    return params
+
+
+@ocr_bp.post("/async/extract")
+def async_extract():
+    """提交异步抽取任务：立即落盘 pending 记录，返回 {extraction_id, job_id, status: pending}。
+
+    后续通过 GET /async/extractions/<id>/status 轮询结果。
+    """
+    if _client() is None:
+        raise _fail(503, "service_unavailable", "TextIn 服务未配置")
+
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        raise _fail(422, "validation_failed", "异步抽取必须上传文件")
+    content = file.read()
+    settings = _settings()
+    if len(content) == 0:
+        raise _fail(400, "invalid_format", "上传文件为空")
+    if len(content) > settings.max_upload_bytes:
+        raise _fail(413, "invalid_format", f"文件超过 {settings.max_upload_bytes} 字节上限")
+
+    params = _parse_async_params()
+
+    try:
+        result = submit_async_job(
+            settings,
+            _client(),  # type: ignore[arg-type]
+            file.filename,
+            content,
+            file.content_type or "application/octet-stream",
+            params,
+        )
+    except TextInAPIError as e:
+        raise _fail(502, "validation_failed", str(e))
+    return _ok(result, msg="异步任务已提交")
+
+
+@ocr_bp.get("/async/extractions/<extraction_id>/status")
+def async_status_route(extraction_id: str):
+    """轮询异步任务状态：completed 时 record 字段填充完整 ExtractionRecord。"""
+    _require_uuid(extraction_id)
+    if _client() is None:
+        raise _fail(503, "service_unavailable", "TextIn 服务未配置")
+    try:
+        result = poll_async_status(_settings(), _client(), extraction_id)  # type: ignore[arg-type]
+    except ExtractionNotFound:
+        raise _fail(404, "not_found", f"extraction_id={extraction_id} 不存在")
+    except RecordParseError as e:
+        logger.warning("Record parse failed for %s: %s", extraction_id, e)
+        raise _fail(500, "internal_error", "记录解析失败")
+    except TextInAPIError as e:
+        raise _fail(502, "validation_failed", str(e))
+    return _ok(result, msg="ok")

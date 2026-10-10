@@ -12,6 +12,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 SourceType = Literal["file", "url"]
+ExtractionStatus = Literal["success", "pending", "in_progress", "completed", "failed"]
 
 
 class ExtractSummary(BaseModel):
@@ -51,7 +52,7 @@ class ExtractionListItem(BaseModel):
     page_count: int
     item_count: int
     field_count: int = 0
-    status: Literal["success"] = "success"
+    status: ExtractionStatus = "success"
 
 
 class ExtractionRecord(BaseModel):
@@ -64,3 +65,24 @@ class ExtractionRecord(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     textin_response: dict[str, Any]
     fields: list[ExtractedField] = Field(default_factory=list)
+    status: ExtractionStatus = "success"
+    async_job_id: str | None = None
+
+
+class AsyncSubmitResponse(BaseModel):
+    """POST /api/v1/ocr/async/extract 的成功响应。"""
+
+    extraction_id: str
+    job_id: str
+    status: Literal["pending"] = "pending"
+
+
+class AsyncStatusResponse(BaseModel):
+    """GET /api/v1/ocr/async/extractions/{id}/status 的成功响应。
+
+    record 仅在 status == "completed" 时填充；pending / in_progress / failed 时为 None。
+    """
+
+    status: ExtractionStatus
+    record: ExtractionRecord | None = None
+    message: str | None = None
