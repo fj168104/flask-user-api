@@ -29,6 +29,7 @@ def test_route_map_registered(textin_app: Flask) -> None:
     assert "/api/v1/ocr/extractions" in rules
     assert "/api/v1/ocr/extractions/<extraction_id>" in rules
     assert "/api/v1/ocr/extractions/<extraction_id>/file" in rules
+    assert "/api/v1/ocr/extractions/<extraction_id>/refine" in rules
 
 
 def test_no_auth_required_on_any_route(client) -> None:
@@ -350,3 +351,236 @@ def test_get_file_unknown_id_returns_404(client) -> None:
 def test_get_file_invalid_id_returns_404(client) -> None:
     got = client.get("/api/v1/ocr/extractions/../../etc/passwd/file")
     assert got.status_code == 404
+
+
+# ---------- POST /extractions/<id>/refine ----------
+
+
+def _make_file_record(client) -> str:
+    """Helper: POST /extract with a real file → return extraction_id."""
+    from io import BytesIO
+
+    r = client.post(
+        "/api/v1/ocr/extract",
+        data={
+            "source_type": "file",
+            "file": (BytesIO(b"%PDF-1.4\nfake"), "a.pdf"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 200, r.data
+    return r.get_json()["data"]["extraction_id"]
+
+
+def test_refine_happy_path_replaces_fields(textin_app: Flask, client) -> None:
+    """happy path: 旧字段命中同名 schema 会被替换，未命中的保留，新增追加；field_source 变 mixed。"""
+    schema_called = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = str(request.url.path)
+        if path.endswith("/extract/sync"):
+            schema_called["count"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "data": {
+                        "result": {
+                            "extracted_schema": {
+                                "发票号": "SCHEMA-NEW",  # 替换旧启发式 "INV-1"
+                                "日期": "2026-10-10",     # 新字段
+                            }
+                        }
+                    },
+                },
+            )
+        # parse/sync：返回的 markdown 里应包含启发式字段
+        return httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "elements": [],
+                "metadata": {"page_count": 1},
+                "markdown": "# Invoice\n发票号: INV-1\n金额: 99.00",
+            },
+        )
+
+    textin_app.extensions["textin_client"] = TextInClient(
+        textin_app.extensions["textin_settings"],
+        transport=httpx.MockTransport(handler),
+    )
+    c = textin_app.test_client()
+
+    eid = _make_file_record(c)
+    # 先验证旧字段是启发式
+    before = c.get(f"/api/v1/ocr/extractions/{eid}").get_json()["data"]
+    names_before = {(f["name"], f["source"]) for f in before["fields"]}
+    assert ("发票号", "markdown") in names_before
+
+    # refine
+    resp = c.post(
+        f"/api/v1/ocr/extractions/{eid}/refine",
+        json={"field_names": ["发票号", "日期"]},
+    )
+    assert resp.status_code == 200, resp.data
+    body = resp.get_json()
+    assert body["code"] == 200
+    record = body["data"]
+    fields = {(f["name"], f["source"]) for f in record["fields"]}
+    # 替换: 发票号 → schema
+    assert ("发票号", "schema") in fields
+    # 新增: 字段 date
+    assert ("日期", "schema") in fields
+    # 启发式 金额 保留
+    assert ("金额", "markdown") in fields
+    assert schema_called["count"] == 1
+
+
+def test_refine_empty_field_names_returns_422(client) -> None:
+    eid = _make_file_record(client)
+    resp = client.post(f"/api/v1/ocr/extractions/{eid}/refine", json={"field_names": []})
+    assert resp.status_code == 422
+    assert resp.get_json()["code"] == 422
+
+
+def test_refine_missing_field_names_returns_422(client) -> None:
+    eid = _make_file_record(client)
+    resp = client.post(f"/api/v1/ocr/extractions/{eid}/refine", json={})
+    assert resp.status_code == 422
+
+
+def test_refine_too_many_field_names_returns_422(client) -> None:
+    eid = _make_file_record(client)
+    resp = client.post(
+        f"/api/v1/ocr/extractions/{eid}/refine",
+        json={"field_names": [f"f{i}" for i in range(51)]},
+    )
+    assert resp.status_code == 422
+    assert "上限" in resp.get_json()["msg"]
+
+
+def test_refine_url_source_returns_422(client) -> None:
+    """URL 抽取结果不允许 refine → 422 with specific msg。"""
+    r = client.post(
+        "/api/v1/ocr/extract",
+        data={"source_type": "url", "url": "https://x.example/y.jpg"},
+    )
+    eid = r.get_json()["data"]["extraction_id"]
+
+    resp = client.post(
+        f"/api/v1/ocr/extractions/{eid}/refine",
+        json={"field_names": ["发票号"]},
+    )
+    assert resp.status_code == 422
+    assert "URL" in resp.get_json()["msg"]
+
+
+def test_refine_unknown_extraction_returns_404(client) -> None:
+    resp = client.post(
+        "/api/v1/ocr/extractions/11111111-1111-4111-8111-111111111111/refine",
+        json={"field_names": ["发票号"]},
+    )
+    assert resp.status_code == 404
+
+
+def test_refine_invalid_id_returns_404(client) -> None:
+    resp = client.post(
+        "/api/v1/ocr/extractions/not-a-uuid/refine",
+        json={"field_names": ["发票号"]},
+    )
+    assert resp.status_code == 404
+
+
+def test_refine_textin_business_error_returns_502(textin_app: Flask, client) -> None:
+    """schema 接口返回业务错误时，路由映射 502。"""
+    from io import BytesIO
+
+    def make_record() -> str:
+        # 先用默认 mock 跑一次 extract 建档
+        r = client.post(
+            "/api/v1/ocr/extract",
+            data={
+                "source_type": "file",
+                "file": (BytesIO(b"%PDF-1.4\nfake"), "a.pdf"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert r.status_code == 200, r.data
+        return r.get_json()["data"]["extraction_id"]
+
+    eid = make_record()
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 40101, "message": "invalid app id"})
+
+    textin_app.extensions["textin_client"] = TextInClient(
+        textin_app.extensions["textin_settings"],
+        transport=httpx.MockTransport(handler),
+    )
+    c = textin_app.test_client()
+
+    resp = c.post(
+        f"/api/v1/ocr/extractions/{eid}/refine",
+        json={"field_names": ["发票号"]},
+    )
+    assert resp.status_code == 502
+    assert "40101" in resp.get_json()["msg"]
+
+
+def test_refine_503_when_no_client(textin_app: Flask, client) -> None:
+    eid = _make_file_record(client)
+
+    textin_app.extensions["textin_client"] = None
+    c = textin_app.test_client()
+    resp = c.post(
+        f"/api/v1/ocr/extractions/{eid}/refine",
+        json={"field_names": ["发票号"]},
+    )
+    assert resp.status_code == 503
+
+
+def test_refine_in_place_update_no_new_record(textin_app: Flask, client, tmp_path: Path) -> None:
+    """refine 后 extraction_id 不变（原地更新），records 总数不变。"""
+    eid = _make_file_record(client)
+
+    # count before
+    before = client.get("/api/v1/ocr/extractions").get_json()["data"]
+    assert len(before) == 1
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = str(request.url.path)
+        if path.endswith("/extract/sync"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "data": {"result": {"extracted_schema": {"发票号": "NEW"}}},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "elements": [],
+                "metadata": {"page_count": 1},
+                "markdown": "发票号: OLD",
+            },
+        )
+
+    textin_app.extensions["textin_client"] = TextInClient(
+        textin_app.extensions["textin_settings"],
+        transport=httpx.MockTransport(handler),
+    )
+    c = textin_app.test_client()
+
+    resp = c.post(
+        f"/api/v1/ocr/extractions/{eid}/refine",
+        json={"field_names": ["发票号"]},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["data"]["extraction_id"] == eid
+
+    # count after — still 1
+    after = client.get("/api/v1/ocr/extractions").get_json()["data"]
+    assert len(after) == 1
+    assert after[0]["extraction_id"] == eid

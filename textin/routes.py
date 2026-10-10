@@ -27,11 +27,13 @@ from textin.errors import (
 )
 from textin.service import (
     EXTRACTION_ID_PATTERN,
+    REFINE_MAX_FIELD_NAMES,
     find_uploaded_file,
     get_extraction,
     is_valid_extraction_id,
     list_extractions,
     poll_async_status,
+    refine_with_schema,
     run_extraction,
     submit_async_job,
 )
@@ -306,3 +308,59 @@ def async_status_route(extraction_id: str):
     except TextInAPIError as e:
         raise _fail(502, "validation_failed", str(e))
     return _ok(result, msg="ok")
+
+
+# ---------- refine ----------
+
+
+@ocr_bp.post("/extractions/<extraction_id>/refine")
+def refine_extraction(extraction_id: str):
+    """对已落盘记录重跑 schema 接口（按用户挑选的字段名）→ 合并到 record.fields。
+
+    JSON body: {"field_names": ["发票号", "金额"]}
+    返回整个更新后的 ExtractionRecord dict。
+    """
+    _require_uuid(extraction_id)
+    if _client() is None:
+        raise _fail(503, "service_unavailable", "TextIn 服务未配置")
+
+    body = request.get_json(silent=True) or {}
+    raw_names = body.get("field_names")
+    if not isinstance(raw_names, list) or not raw_names:
+        raise _fail(422, "validation_failed", "field_names 必须是非空数组")
+    field_names = [str(n).strip() for n in raw_names if isinstance(n, (str, int)) and str(n).strip()]
+    if not field_names:
+        raise _fail(422, "validation_failed", "field_names 至少包含一个有效字段名")
+    if len(field_names) > REFINE_MAX_FIELD_NAMES:
+        raise _fail(
+            422,
+            "validation_failed",
+            f"field_names 超过上限 {REFINE_MAX_FIELD_NAMES}",
+        )
+
+    try:
+        record = refine_with_schema(
+            _settings(),
+            _client(),  # type: ignore[arg-type]
+            extraction_id,
+            field_names,
+        )
+    except ExtractionNotFound:
+        raise _fail(404, "not_found", f"extraction_id={extraction_id} 不存在")
+    except UploadedFileNotFound:
+        raise _fail(
+            404,
+            "not_found",
+            f"extraction_id={extraction_id} 无原始文件（URL 抽取或已清理）",
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "URL" in msg:
+            raise _fail(422, "validation_failed", "URL 抽取结果不支持 refine（无本地文件）")
+        raise _fail(422, "validation_failed", msg)
+    except TextInAPIError as e:
+        raise _fail(502, "validation_failed", str(e))
+    except RecordParseError as e:
+        logger.warning("Record parse failed for %s: %s", extraction_id, e)
+        raise _fail(500, "internal_error", "记录解析失败")
+    return _ok(record, msg="精修完成")

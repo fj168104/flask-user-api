@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import re
 from datetime import datetime, timezone
 from mimetypes import guess_extension
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from textin.client import TextInClient, parse_extracted_schema
@@ -39,7 +40,7 @@ from textin.schemas import (
 
 logger = logging.getLogger(__name__)
 
-FieldSource = str  # "schema" | "heuristic"
+FieldSource = Literal["schema", "heuristic", "mixed"]
 
 # extraction_id 必须为 RFC 4122 UUID（小写 hex + 连字符），避免路径穿越。
 EXTRACTION_ID_PATTERN = re.compile(
@@ -183,6 +184,115 @@ def _load_record_fields(data: dict[str, Any]) -> tuple[list[dict[str, Any]], Fie
     if "fields" in data and isinstance(data["fields"], list):
         return list(data["fields"]), field_source
     return extract_fields(data["textin_response"]), "heuristic"
+
+
+def _merge_fields(
+    old: list[dict[str, Any]],
+    schema_fields: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """按 name 合并启发式/表格字段与 schema 精修结果。
+
+    - 同 name 的旧条目被 schema 版替换（更新值，不必改 value）。
+    - 旧条目里没有命中的、schema 版里出现的，追加。
+    - schema 版之外的旧条目保留原样。
+    """
+    schema_by_name: dict[str, dict[str, Any]] = {f["name"]: f for f in schema_fields if f.get("name")}
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in old:
+        name = entry.get("name")
+        if name in schema_by_name:
+            merged.append(schema_by_name[name])
+            seen.add(name)
+        else:
+            merged.append(entry)
+    for entry in schema_fields:
+        if entry.get("name") not in seen:
+            merged.append(entry)
+    return merged
+
+
+def _compute_field_source(old: list[dict[str, Any]], new: list[dict[str, Any]]) -> FieldSource:
+    """根据 merge 后的字段列表推导：
+      - 全部 schema → "schema"
+      - 全部 heuristic/table → "heuristic"
+      - 混合 → "mixed"
+    """
+    sources = {f.get("source") for f in new}
+    if sources == {"schema"}:
+        return "schema"
+    if sources.issubset({"table", "markdown", "heuristic"}) and sources:
+        return "heuristic"
+    if sources and "schema" in sources:
+        return "mixed"
+    return "heuristic"
+
+
+# 单次 refine 允许的最大字段数（防止误传 + 保护 TextIn 配额）
+REFINE_MAX_FIELD_NAMES = 50
+
+
+def refine_with_schema(
+    settings: TextInSettings,
+    client: TextInClient,
+    extraction_id: str,
+    field_names: list[str],
+) -> dict[str, Any]:
+    """对已落盘记录重跑 schema 接口，合并回 record.fields。
+
+    假设：
+    - record 存在且 source_type == "file"
+    - 原始上传文件仍可从 uploads_dir 按 extraction_id 找到
+
+    返回整个更新后的 ExtractionRecord dict（含 textin_response）。
+    """
+    data = _read_record(settings.ocr_storage_dir, extraction_id)
+    if data.get("source_type") != "file":
+        raise ValueError("URL 抽取结果不支持 refine（无本地文件）")
+
+    uploaded_path = find_uploaded_file(settings.ocr_uploads_dir, extraction_id)
+    file_bytes = uploaded_path.read_bytes()
+    content_type = mimetypes.guess_type(uploaded_path.name)[0] or "application/octet-stream"
+
+    schema_resp = client.extract_with_schema(
+        filename=data.get("source_ref") or uploaded_path.name,
+        content=file_bytes,
+        content_type=content_type,
+        schema_fields=field_names,
+        parse_params=data.get("params") or {},
+    )
+
+    result = schema_resp.get("result") if isinstance(schema_resp, dict) else None
+    extracted = result.get("extracted_schema") if isinstance(result, dict) else None
+    schema_fields = parse_extracted_schema(extracted)
+
+    old_fields = data.get("fields") or []
+    merged = _merge_fields(old_fields, schema_fields)
+    new_field_source = _compute_field_source(old_fields, merged)
+
+    _write_record(
+        settings.ocr_storage_dir,
+        extraction_id,
+        data["source_type"],
+        data["source_ref"],
+        data.get("params") or {},
+        data.get("textin_response") or {},
+        merged,
+        new_field_source,
+        status=data.get("status", "success"),
+        async_job_id=data.get("async_job_id"),
+    )
+    logger.info(
+        "OCR refine saved: id=%s requested=%d schema_hits=%d merged=%d field_source=%s",
+        extraction_id,
+        len(field_names),
+        len(schema_fields),
+        len(merged),
+        new_field_source,
+    )
+
+    updated = _read_record(settings.ocr_storage_dir, extraction_id)
+    return _build_extraction_record(updated).model_dump(mode="json")
 
 
 def run_extraction(
