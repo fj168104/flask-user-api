@@ -85,9 +85,10 @@ def _verify_line_id_token(id_token: str) -> dict:
             "AUTH_SERVICE_UNAVAILABLE", "auth.line_not_configured"
         )
     try:
-        resp = httpx.get(
+        # LINE 文档：验 ID token 必须用 POST + form（GET /verify 是验 access token 的端点）
+        resp = httpx.post(
             LINE_VERIFY_URL,
-            params={"id_token": id_token, "client_id": channel_id},
+            data={"id_token": id_token, "client_id": channel_id},
             timeout=httpx.Timeout(10.0, connect=5.0),
         )
     except httpx.HTTPError as e:
