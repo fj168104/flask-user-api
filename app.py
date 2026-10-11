@@ -45,8 +45,9 @@ def create_app(config_overrides: dict | None = None) -> Flask:
     def _request_too_large(_):
         return error_response(invalid_argument("files.too_large"))
 
-    for key in ("FILE_STORAGE_DIR", "EXPORT_STORAGE_DIR", "OCR_STORAGE_DIR"):
-        os.makedirs(app.config[key], exist_ok=True)
+    if app.config.get("STORAGE_BACKEND", "local") == "local":
+        for key in ("FILE_STORAGE_DIR", "EXPORT_STORAGE_DIR", "OCR_STORAGE_DIR"):
+            os.makedirs(app.config[key], exist_ok=True)
 
     with app.app_context():
         db.create_all()

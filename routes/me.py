@@ -6,6 +6,7 @@ from flask import Blueprint, request
 from auth import audit, current_user
 from errors import invalid_argument, ok
 from extensions import db
+import quota
 from models import (
     Application,
     AuditEvent,
@@ -20,6 +21,12 @@ bp = Blueprint("me", __name__)
 @bp.get("/me")
 def me_get():
     return ok(current_user().to_dict())
+
+
+@bp.get("/me/quota")
+def me_quota():
+    """当前有效工作空间的配额视图（PRD v1.4 §20：赠送/消耗/剩余）。"""
+    return ok({"workspaces": quota.quota_summary(current_user())})
 
 
 @bp.patch("/me")

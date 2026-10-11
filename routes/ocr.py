@@ -16,6 +16,7 @@ from errors import invalid_argument, not_found, ok, state_conflict
 from extensions import db
 from fileaccess import get_file_for_user
 from models import File, Membership, OcrJob
+import quota
 from workspace import resolve_workspace
 
 ocr_bp = Blueprint("ocr", __name__)
@@ -159,6 +160,8 @@ def create_job():
         idempotency_key=idem,
     )
     db.session.add(job)
+    db.session.flush()  # 先生成 job.id，配额消耗才能关联
+    quota.check_and_consume(job)
     db.session.commit()
     audit("job.create", "ocr_job", job.id, {"file_id": file.id, "params": stored_params})
     return ok(_summary(job), status=201)
@@ -247,6 +250,7 @@ def cancel_job(job_id: str):
     if job.status == "QUEUED":
         job.status = "CANCELLED"
         job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        quota.refund_for_job(job.id)  # 未产出结果：返还本次消耗
     else:
         job.status = "CANCEL_REQUESTED"
     db.session.commit()
@@ -278,6 +282,8 @@ def rerun_job(job_id: str):
         parent_job_id=old.id,
     )
     db.session.add(job)
+    db.session.flush()
+    quota.check_and_consume(job)
     db.session.commit()
     audit("job.rerun", "ocr_job", job.id, {"parent_job_id": old.id})
     return ok(_summary(job), status=201)
@@ -299,14 +305,11 @@ def delete_job(job_id: str):
             synchronize_session=False
         )
         exports = Export.query.filter(Export.result_version_id.in_(version_ids)).all()
+        import storage
+
         for exp in exports:
             if exp.storage_path:
-                from pathlib import Path
-
-                try:
-                    Path(exp.storage_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
+                storage.delete(exp.storage_path)
             db.session.delete(exp)
         for v in versions:
             db.session.delete(v)

@@ -1,16 +1,17 @@
-"""结果导出（PRD §10.4）：POST 创建 → GET 查询 → GET /download 落盘。
+"""结果导出（PRD §10.4）：POST 创建 → GET 查询 → GET /download 代理下发。
 
 同步生成（P0 数据量下毫秒级），创建即 READY；24h 后过期。
-下载必须携带会话 Cookie 且通过对象级鉴权——不提供任何匿名 URL。
+字节经对象存储（storage.py：local / firebase）落地；下载必须携带会话 Cookie
+且通过对象级鉴权——不提供任何匿名或签名 URL，一律后端代理 send_file(BytesIO)。
 XLSX 全部单元格按字符串写入，保留前导零；CSV 带 UTF-8 BOM。
 """
 from __future__ import annotations
 
 import csv
+import io
 from datetime import timedelta
-from pathlib import Path
 
-from flask import Blueprint, current_app, request, send_file
+from flask import Blueprint, request, send_file
 
 from auth import audit, current_user
 from errors import (
@@ -23,6 +24,7 @@ from errors import (
 from extensions import db
 from models import Export, File, PageResult, ResultVersion
 from routes.ocr import TERMINAL, _get_job_for_user
+import storage
 
 exports_bp = Blueprint("exports", __name__)
 
@@ -45,10 +47,11 @@ def _load_pages(version_id: str) -> list[PageResult]:
 def _base_name(job) -> str:
     file = db.session.get(File, job.file_id)
     name = (file.original_name if file else "") or job.id
-    return Path(name).stem or job.id
+    stem = name.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return stem or job.id
 
 
-def _build_xlsx(pages: list[PageResult], out: Path, missing_pages: list[int]) -> None:
+def _build_xlsx(pages: list[PageResult], out: io.BytesIO, missing_pages: list[int]) -> None:
     try:
         from openpyxl import Workbook
     except ImportError as e:  # 部署缺依赖时给出可诊断的 503
@@ -94,30 +97,31 @@ def _build_xlsx(pages: list[PageResult], out: Path, missing_pages: list[int]) ->
     wb.save(out)
 
 
-def _build_csv(pages: list[PageResult], out: Path) -> None:
-    with out.open("w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["page", "table_id", "row_index", "column_index", "text"])
-        for page in pages:
-            for t in page.tables or []:
-                for c in t.get("cells") or []:
-                    writer.writerow(
-                        [
-                            page.page_number,
-                            t.get("table_id", ""),
-                            c.get("row_index", 0),
-                            c.get("column_index", 0),
-                            str(c.get("current_text") or ""),
-                        ]
-                    )
+def _build_csv(pages: list[PageResult]) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["page", "table_id", "row_index", "column_index", "text"])
+    for page in pages:
+        for t in page.tables or []:
+            for c in t.get("cells") or []:
+                writer.writerow(
+                    [
+                        page.page_number,
+                        t.get("table_id", ""),
+                        c.get("row_index", 0),
+                        c.get("column_index", 0),
+                        str(c.get("current_text") or ""),
+                    ]
+                )
+    return buf.getvalue().encode("utf-8-sig")
 
 
-def _build_txt(pages: list[PageResult], out: Path) -> None:
+def _build_txt(pages: list[PageResult]) -> bytes:
     parts: list[str] = []
     for page in pages:
         parts.append(f"===== Page {page.page_number} =====")
         parts.append(page.text or "")
-    out.write_text("\n".join(parts), encoding="utf-8")
+    return "\n".join(parts).encode("utf-8")
 
 
 @exports_bp.post("/ocr/jobs/<job_id>/exports")
@@ -135,8 +139,6 @@ def create_export(job_id: str):
     if fmt not in FORMATS:
         raise invalid_argument(field_errors=[{"field": "format", "reason": "invalid"}])
 
-    storage_dir = Path(current_app.config["EXPORT_STORAGE_DIR"])
-    storage_dir.mkdir(parents=True, exist_ok=True)
     from models import _now
 
     exp = Export(
@@ -150,22 +152,26 @@ def create_export(job_id: str):
     db.session.add(exp)
     db.session.flush()
 
-    path = storage_dir / f"{exp.id}.{fmt.lower()}"
     pages = _load_pages(version.id)
     try:
         if fmt == "XLSX":
-            _build_xlsx(pages, path, list(job.missing_pages or []))
+            buf = io.BytesIO()
+            _build_xlsx(pages, buf, list(job.missing_pages or []))
+            data = buf.getvalue()
+            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         elif fmt == "CSV":
-            _build_csv(pages, path)
+            data = _build_csv(pages)
+            mime = "text/csv"
         else:
-            _build_txt(pages, path)
+            data = _build_txt(pages)
+            mime = "text/plain"
+        exp.storage_path = storage.put_bytes("exports", f"{exp.id}.{fmt.lower()}", data, mime)
     except Exception as e:  # noqa: BLE001 生成失败落 FAILED，可重试
         exp.status = "FAILED"
         db.session.commit()
         raise service_unavailable("EXPORT_FAILED", "error.export_failed") from e
 
     exp.status = "READY"
-    exp.storage_path = str(path)
     db.session.commit()
     audit("export.create", "export", exp.id, {"job_id": job.id, "format": fmt})
     return ok(exp.to_dict(), status=201)
@@ -195,8 +201,7 @@ def download_export(export_id: str):
     exp = _get_export_for_user(export_id)
     if exp.status != "READY" or not exp.storage_path:
         raise state_conflict("export.not_ready")
-    path = Path(exp.storage_path)
-    if not path.exists():
+    if not storage.exists(exp.storage_path):
         raise state_conflict("export.not_ready")
     from models import OcrJob
 
@@ -204,7 +209,7 @@ def download_export(export_id: str):
     base = _base_name(job) if job else exp.job_id
     audit("export.download", "export", exp.id)
     return send_file(
-        path,
+        io.BytesIO(storage.get_bytes(exp.storage_path)),
         mimetype={
             "XLSX": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "CSV": "text/csv",

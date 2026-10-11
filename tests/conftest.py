@@ -83,6 +83,7 @@ def app(tmp_path):
             "AUTH_DEV_MODE": True,
             "LINE_CHANNEL_ID": "",
             "OCR_WORKER_ENABLED": False,
+            "STORAGE_BACKEND": "local",
             "FILE_STORAGE_DIR": str(tmp_path / "files"),
             "EXPORT_STORAGE_DIR": str(tmp_path / "exports"),
             "OCR_STORAGE_DIR": str(tmp_path / "audit"),

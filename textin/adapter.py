@@ -8,10 +8,7 @@
 """
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from textin.client import TextInClient, parse_extracted_schema
@@ -231,25 +228,9 @@ def run_extraction(
     return normalized
 
 
-def persist_raw_audit_copy(storage_dir: str, job_id: str, payload: dict[str, Any]) -> str:
-    """原始厂商响应的审计副本（PRD §15 操作追踪），库中只存引用路径。"""
-    d = Path(storage_dir)
-    d.mkdir(parents=True, exist_ok=True)
-    path = d / f"{job_id}.json"
-    path.write_text(
-        json.dumps(
-            {"job_id": job_id, "saved_at": datetime.now(timezone.utc).isoformat(), **payload},
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    return str(path)
-
-
 __all__ = [
     "VENDOR",
     "TextInAPIError",
     "normalize_response",
     "run_extraction",
-    "persist_raw_audit_copy",
 ]

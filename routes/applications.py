@@ -1,7 +1,7 @@
-"""企业认证 / 入企申请 / 邀请（PRD §5、§14.2）。
+"""入企申请 / 邀请（PRD §5、§14.2）。
 
-- 企业认证申请：提交后落 SUBMITTED + 建 PENDING_VERIFICATION 企业行；
-  审核由外部流程完成（PRD §19.4 冻结，ReviewSyncCursor 仅占位）。
+公司本身的添加/修改/编号绑定/解绑在 routes/companies.py；企业认证走
+后台人工审核 enterprises.status，不再走 Application 工单。
 - 入企申请：针对 VERIFIED 企业；申请即建 PENDING 成员行，审核通过转 ACTIVE。
 - 邀请：OWNER/ADMIN 生成一次性令牌（明文只回显一次，库存哈希）；
   兑换需登录态，绝不提供匿名回调。
@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import secrets
 from datetime import timedelta
 
@@ -28,9 +27,6 @@ from models import Application, Enterprise, Invitation, Membership, _now
 
 applications_bp = Blueprint("applications", __name__)
 
-OPEN_APPLICATION_STATUSES = {"SUBMITTED", "UNDER_REVIEW", "NEEDS_INFO"}
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -48,119 +44,7 @@ def _require_admin(user_id: int, enterprise_id: int) -> Membership:
     return m
 
 
-# ---------- 企业认证申请 ----------
-
-
-@applications_bp.post("/enterprises/applications")
-def submit_enterprise_application():
-    user = current_user()
-    body = request.get_json(silent=True) or {}
-    form = body.get("form") if isinstance(body, dict) else None
-    if not isinstance(form, dict):
-        raise invalid_argument(field_errors=[{"field": "form", "reason": "required"}])
-
-    legal_name = str(form.get("legal_name") or "").strip()
-    country = str(form.get("country") or "TH").strip().upper()
-    reg_no = str(form.get("registration_no") or "").strip()
-    contact_name = str(form.get("contact_name") or "").strip()
-    contact_email = str(form.get("contact_email") or "").strip()
-    contact_phone = str(form.get("contact_phone") or "").strip()
-
-    field_errors = []
-    if not 1 <= len(legal_name) <= 255:
-        field_errors.append({"field": "legal_name", "reason": "required"})
-    if not re.fullmatch(r"[A-Z]{2,8}", country):
-        field_errors.append({"field": "country", "reason": "invalid"})
-    if not 1 <= len(reg_no) <= 64:
-        field_errors.append({"field": "registration_no", "reason": "required"})
-    if not 1 <= len(contact_name) <= 128:
-        field_errors.append({"field": "contact_name", "reason": "required"})
-    if not EMAIL_RE.fullmatch(contact_email) or len(contact_email) > 128:
-        field_errors.append({"field": "contact_email", "reason": "invalid"})
-    if contact_phone and len(contact_phone) > 32:
-        field_errors.append({"field": "contact_phone", "reason": "invalid"})
-    if field_errors:
-        raise invalid_argument(field_errors=field_errors)
-
-    dup = Application.query.filter(
-        Application.applicant_user_id == user.id,
-        Application.type == "ENTERPRISE_VERIFICATION",
-        Application.status.in_(OPEN_APPLICATION_STATUSES),
-    ).first()
-    if dup is not None:
-        raise state_conflict("application.duplicate_open")
-
-    enterprise = Enterprise(
-        code=f"ent-{_now().strftime('%y%m%d')}-{secrets.token_hex(3)}",
-        country=country,
-        legal_name=legal_name,
-        registration_no=reg_no,
-        status="PENDING_VERIFICATION",
-    )
-    db.session.add(enterprise)
-    db.session.flush()
-
-    app_row = Application(
-        type="ENTERPRISE_VERIFICATION",
-        applicant_user_id=user.id,
-        target_enterprise_id=enterprise.id,
-        form={
-            "legal_name": legal_name,
-            "country": country,
-            "registration_no": reg_no,
-            "contact_name": contact_name,
-            "contact_email": contact_email,
-            "contact_phone": contact_phone,
-        },
-        status="SUBMITTED",
-        submitted_at=_now(),
-    )
-    db.session.add(app_row)
-    db.session.flush()
-    db.session.add(
-        Membership(
-            enterprise_id=enterprise.id,
-            user_id=user.id,
-            role="OWNER",
-            status="PENDING",
-            approved_via="APPLICATION",
-        )
-    )
-    db.session.commit()
-    audit("application.submit", "application", str(app_row.id), {"type": app_row.type})
-    return ok(app_row.to_dict(), status=201)
-
-
-@applications_bp.get("/enterprises/applications")
-def my_enterprise_applications():
-    user = current_user()
-    rows = (
-        Application.query.filter_by(applicant_user_id=user.id, type="ENTERPRISE_VERIFICATION")
-        .order_by(Application.created_at.desc())
-        .all()
-    )
-    out = []
-    for a in rows:
-        d = a.to_dict()
-        e = db.session.get(Enterprise, a.target_enterprise_id) if a.target_enterprise_id else None
-        d["enterprise"] = e.to_dict() if e else None
-        out.append(d)
-    return ok({"items": out})
-
-
 # ---------- 入企申请 ----------
-
-
-@applications_bp.get("/enterprises/lookup")
-def lookup_enterprise():
-    """按 code 查询可加入的企业；仅 VERIFIED 可见，其余 404 不泄露存在性。"""
-    code = (request.args.get("code") or "").strip()
-    if not code or len(code) > 64:
-        raise invalid_argument(field_errors=[{"field": "code", "reason": "required"}])
-    e = Enterprise.query.filter_by(code=code).first()
-    if e is None or e.status != "VERIFIED":
-        raise not_found()
-    return ok({"id": e.id, "code": e.code, "legal_name": e.legal_name, "country": e.country})
 
 
 @applications_bp.post("/enterprises/<int:enterprise_id>/membership-applications")

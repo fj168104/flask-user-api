@@ -9,15 +9,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from extensions import db
-from models import Enterprise, Membership
+from models import Enterprise
 from tests.conftest import PNG_1PX
 
-FORM = {
+COMPANY = {
     "legal_name": "Acme Co",
-    "country": "TH",
     "registration_no": "REG-1",
-    "contact_name": "Boss",
-    "contact_email": "a@b.co",
     "contact_phone": "0812345678",
 }
 
@@ -46,18 +43,16 @@ def _make_ready_file(c, h, name="doc.png"):
     return r.get_json()["data"]["file"]
 
 
-def _verified_enterprise(app, c, h, user_id):
-    r = c.post("/api/v1/enterprises/applications", json={"form": FORM}, headers=h)
+def _verified_enterprise(app, c, h):
+    """添加公司 + 模拟后台人工审核（UPDATE enterprises SET status='VERIFIED'）；返回企业 dict。"""
+    r = c.post("/api/v1/enterprises", json=COMPANY, headers=h)
     assert r.status_code == 201, r.get_json()
-    ent_id = r.get_json()["data"]["target_enterprise_id"]
+    ent = r.get_json()["data"]["enterprise"]
     with app.app_context():
-        e = db.session.get(Enterprise, ent_id)
+        e = db.session.get(Enterprise, ent["id"])
         e.status = "VERIFIED"
-        m = Membership.query.filter_by(enterprise_id=ent_id, user_id=user_id).one()
-        m.status = "ACTIVE"
-        m.decided_at = _now()
         db.session.commit()
-    return ent_id
+    return ent
 
 
 # ---------- 门禁 ----------
@@ -68,7 +63,7 @@ def test_health(client):
 
 def test_anonymous_gate(client):
     for path in ["/api/v1/me", "/api/v1/me/workspaces", "/api/v1/files/x",
-                 "/api/v1/ocr/jobs", "/api/v1/exports/x", "/api/v1/enterprises/applications"]:
+                 "/api/v1/ocr/jobs", "/api/v1/exports/x", "/api/v1/enterprises/mine"]:
         assert client.get(path).status_code == 401, path
 
 
@@ -406,35 +401,182 @@ def test_exports_stranger_404(succeeded_job, app):
     assert c2.get(f"/api/v1/exports/{exp['id']}/download", headers=h2).status_code == 404
 
 
-# ---------- 企业入驻与邀请 ----------
+# ---------- 公司（添加/修改/编号绑定/解绑 + 人工审核） ----------
 
-def test_application_happy_path(auth):
+def test_company_create_pending_then_manual_review(auth, app):
+    """添加公司 → 待审核（不可绑定/不进工作空间）→ 人工 VERIFIED → 生效。"""
     c, h, _ = auth
-    r = c.post("/api/v1/enterprises/applications", json={"form": FORM}, headers=h)
-    assert r.status_code == 201
-    assert r.get_json()["data"]["status"] == "SUBMITTED"
+    r = c.post("/api/v1/enterprises", json=COMPANY, headers=h)
+    assert r.status_code == 201, r.get_json()
+    ent = r.get_json()["data"]["enterprise"]
+    assert ent["status"] == "PENDING_VERIFICATION"
+    assert ent["contact_phone"] == COMPANY["contact_phone"]
+    assert ent["id"] and ent["code"]  # 编号自增生成
 
-    r = c.post("/api/v1/enterprises/applications", json={"form": FORM}, headers=h)
-    assert r.status_code == 409
+    # 未过审：不出现在工作空间
+    r = c.get("/api/v1/me/workspaces", headers=h)
+    assert all(w["workspace_type"] == "PERSONAL"
+               for w in r.get_json()["data"]["workspaces"])
+    # 未过审：他人按代码绑定 404（不泄露存在性）
+    c2, h2, _ = _login(app, "dev-binder")
+    r = c2.post("/api/v1/enterprises/bind", json={"code": ent["code"]}, headers=h2)
+    assert r.status_code == 404
 
-    r = c.get("/api/v1/enterprises/applications", headers=h)
-    assert r.status_code == 200
+    # 我的公司可见：OWNER / ACTIVE / 待审核
+    r = c.get("/api/v1/enterprises/mine", headers=h)
     items = r.get_json()["data"]["items"]
     assert len(items) == 1
-    assert items[0]["enterprise"]["legal_name"] == FORM["legal_name"]
+    assert items[0]["id"] == ent["id"]
+    assert items[0]["my_role"] == "OWNER"
+    assert items[0]["membership_status"] == "ACTIVE"
+
+    # 后台人工审核：UPDATE enterprises SET status='VERIFIED' WHERE id=…
+    with app.app_context():
+        db.session.get(Enterprise, ent["id"]).status = "VERIFIED"
+        db.session.commit()
+
+    r = c.get("/api/v1/me/workspaces", headers=h)
+    ent_ws = [w for w in r.get_json()["data"]["workspaces"]
+              if w["workspace_type"] == "ENTERPRISE"]
+    assert len(ent_ws) == 1
+    assert ent_ws[0]["enterprise_name"] == COMPANY["legal_name"]
+
+    r = c2.post("/api/v1/enterprises/bind", json={"code": ent["code"]}, headers=h2)
+    assert r.status_code == 200
+    assert r.get_json()["data"]["role"] == "MEMBER"
 
 
-def test_application_validation(auth):
+def test_company_create_validation(auth):
     c, h, _ = auth
-    bad = {**FORM, "contact_email": "not-an-email"}
-    r = c.post("/api/v1/enterprises/applications", json={"form": bad}, headers=h)
+    r = c.post("/api/v1/enterprises",
+               json={"legal_name": "", "registration_no": "R"}, headers=h)
     assert r.status_code == 400
-    assert any(fe["field"] == "contact_email" for fe in r.get_json()["field_errors"])
+    assert any(fe["field"] == "legal_name" for fe in r.get_json()["field_errors"])
+    r = c.post("/api/v1/enterprises",
+               json={"legal_name": "X", "registration_no": ""}, headers=h)
+    assert r.status_code == 400
+    r = c.post("/api/v1/enterprises",
+               json={"legal_name": "X", "registration_no": "R",
+                     "contact_phone": "x" * 33}, headers=h)
+    assert r.status_code == 400
+    assert any(fe["field"] == "contact_phone" for fe in r.get_json()["field_errors"])
+
+
+def test_company_edit_rules(auth, app):
+    c, h, _ = auth
+    r = c.post("/api/v1/enterprises", json=COMPANY, headers=h)
+    ent_id = r.get_json()["data"]["enterprise"]["id"]
+
+    # 非 OWNER 不可改
+    c2, h2, _ = _login(app, "dev-editor")
+    r = c2.patch(f"/api/v1/enterprises/{ent_id}", json=COMPANY, headers=h2)
+    assert r.status_code == 403
+
+    # OWNER 修改：仍处待审核
+    upd = {**COMPANY, "legal_name": "Acme Renamed", "contact_phone": "099"}
+    r = c.patch(f"/api/v1/enterprises/{ent_id}", json=upd, headers=h)
+    assert r.status_code == 200
+    ent = r.get_json()["data"]["enterprise"]
+    assert ent["legal_name"] == "Acme Renamed"
+    assert ent["contact_phone"] == "099"
+    assert ent["status"] == "PENDING_VERIFICATION"
+
+    # 过审后再改 → 回到待审核（重新审核后才生效）
+    with app.app_context():
+        db.session.get(Enterprise, ent_id).status = "VERIFIED"
+        db.session.commit()
+    r = c.patch(f"/api/v1/enterprises/{ent_id}", json=upd, headers=h)
+    assert r.get_json()["data"]["enterprise"]["status"] == "PENDING_VERIFICATION"
+
+
+def test_company_bind_multi_and_unbind(auth, app):
+    c1, h1, _ = auth
+    e1 = _verified_enterprise(app, c1, h1)
+    e2 = _verified_enterprise(app, c1, h1)
+    c2, h2, _ = _login(app, "dev-multi")
+
+    # 一人可绑定多个公司（仅按公司代码）
+    for e in (e1, e2):
+        r = c2.post("/api/v1/enterprises/bind", json={"code": e["code"]}, headers=h2)
+        assert r.status_code == 200
+    r = c2.get("/api/v1/me/workspaces", headers=h2)
+    ent_ws = [w for w in r.get_json()["data"]["workspaces"]
+              if w["workspace_type"] == "ENTERPRISE"]
+    assert len(ent_ws) == 2
+
+    # 重复绑定 409
+    r = c2.post("/api/v1/enterprises/bind", json={"code": e1["code"]}, headers=h2)
+    assert r.status_code == 409
+
+    # 解绑一个 → 工作空间只剩另一个；mine 不再列出
+    r = c2.post(f"/api/v1/enterprises/{e1['id']}/unbind", headers=h2)
+    assert r.status_code == 200
+    r = c2.get("/api/v1/me/workspaces", headers=h2)
+    ent_ws = [w for w in r.get_json()["data"]["workspaces"]
+              if w["workspace_type"] == "ENTERPRISE"]
+    assert len(ent_ws) == 1 and ent_ws[0]["enterprise_id"] == e2["id"]
+    r = c2.get("/api/v1/enterprises/mine", headers=h2)
+    assert all(i["id"] != e1["id"] for i in r.get_json()["data"]["items"])
+
+    # 解绑后可重新绑定
+    r = c2.post("/api/v1/enterprises/bind", json={"code": e1["code"]}, headers=h2)
+    assert r.status_code == 200
+
+
+def test_company_bind_by_code(auth, app):
+    """绑定只认公司代码（ent-…）；数字编号被拒；未知代码 404 不泄露存在性。"""
+    c1, h1, _ = auth
+    r = c1.post("/api/v1/enterprises", json=COMPANY, headers=h1)
+    ent = r.get_json()["data"]["enterprise"]
+    with app.app_context():
+        db.session.get(Enterprise, ent["id"]).status = "VERIFIED"
+        db.session.commit()
+
+    c2, h2, _ = _login(app, "dev-code-binder")
+    r = c2.post("/api/v1/enterprises/bind", json={"code": ent["code"]}, headers=h2)
+    assert r.status_code == 200
+    assert r.get_json()["data"]["enterprise"]["id"] == ent["id"]
+    assert r.get_json()["data"]["role"] == "MEMBER"
+
+    # 已绑定后按代码再绑 → 409；未知代码 → 404
+    r = c2.post("/api/v1/enterprises/bind", json={"code": ent["code"]}, headers=h2)
+    assert r.status_code == 409
+    r = c2.post("/api/v1/enterprises/bind", json={"code": "ent-000000-deadbe"}, headers=h2)
+    assert r.status_code == 404
+
+    # 只按代码：数字编号与空 body → 400
+    r = c2.post("/api/v1/enterprises/bind", json={"enterprise_id": ent["id"]}, headers=h2)
+    assert r.status_code == 400
+    r = c2.post("/api/v1/enterprises/bind", json={}, headers=h2)
+    assert r.status_code == 400
+
+
+def test_company_cert_photo(auth, app):
+    c, h, _ = auth
+    r = c.post("/api/v1/uploads",
+               json={"file_name": "cert.png", "size_bytes": len(PNG_1PX),
+                     "purpose": "APPLICATION_MATERIAL"}, headers=h)
+    assert r.status_code == 201, r.get_json()
+    f = r.get_json()["data"]["file"]
+    r = c.put(f"/api/v1/uploads/{f['id']}/content", data=PNG_1PX,
+              headers={"Content-Type": "image/png", **h})
+    assert r.status_code == 200
+    r = c.post(f"/api/v1/uploads/{f['id']}/complete", headers=h)
+    assert r.status_code == 200
+
+    r = c.post("/api/v1/enterprises", json={**COMPANY, "cert_file_id": f["id"]}, headers=h)
+    assert r.status_code == 201
+    assert r.get_json()["data"]["enterprise"]["cert_file_id"] == f["id"]
+
+    # 他人的文件不能作为证明材料
+    c2, h2, _ = _login(app, "dev-cert")
+    r = c2.post("/api/v1/enterprises", json={**COMPANY, "cert_file_id": f["id"]}, headers=h2)
+    assert r.status_code == 400
 
 
 def test_invitation_full_cycle(auth, app):
     c1, h1, u1 = auth
-    ent_id = _verified_enterprise(app, c1, h1, u1["id"])
+    ent_id = _verified_enterprise(app, c1, h1)["id"]
 
     c2, h2, _ = _login(app, "dev-erin")
     r = c2.post(f"/api/v1/enterprises/{ent_id}/invitations", headers=h2, json={})
@@ -464,7 +606,7 @@ def test_invitation_full_cycle(auth, app):
 
 def test_invitation_revoke(auth, app):
     c1, h1, u1 = auth
-    ent_id = _verified_enterprise(app, c1, h1, u1["id"])
+    ent_id = _verified_enterprise(app, c1, h1)["id"]
     r = c1.post(f"/api/v1/enterprises/{ent_id}/invitations", headers=h1, json={})
     inv = r.get_json()["data"]
     c2, h2, _ = _login(app, "dev-finn")
@@ -477,7 +619,7 @@ def test_invitation_revoke(auth, app):
 
 def test_enterprise_file_access(auth, app):
     c1, h1, u1 = auth
-    ent_id = _verified_enterprise(app, c1, h1, u1["id"])
+    ent_id = _verified_enterprise(app, c1, h1)["id"]
     r = c1.post("/api/v1/uploads", headers=h1,
                 json={"file_name": "ent.png", "size_bytes": len(PNG_1PX),
                       "workspace_type": "ENTERPRISE", "enterprise_id": ent_id})
@@ -493,3 +635,147 @@ def test_enterprise_file_access(auth, app):
     r = c3.post("/api/v1/invitations/redeem", headers=h3, json={"token": token})
     assert r.status_code == 200
     assert c3.get(f"/api/v1/files/{f['id']}", headers=h3).status_code == 200
+
+
+# ---------- 配额（PRD v1.4 §20） ----------
+
+
+def _quota_of(c, h, ws_type="PERSONAL"):
+    r = c.get("/api/v1/me/quota", headers=h)
+    assert r.status_code == 200, r.get_json()
+    return next(
+        w for w in r.get_json()["data"]["workspaces"] if w["workspace_type"] == ws_type
+    )
+
+
+def test_first_login_bonus_no_double_grant(app, auth):
+    c, h, _ = auth
+    ws = _quota_of(c, h)
+    assert ws["plan"]["code"] == "KINDER"
+    assert ws["plan"]["free_unit"] == "OCR_TASK"
+    assert ws["free_tasks"] == {"total": 1000, "remaining": 1000}
+
+    # 再次登录（新会话）不重复发放
+    r = c.post("/api/v1/auth/line", json={"dev_id": "tester"})
+    assert r.status_code == 200, r.get_json()
+    h2 = {"X-CSRF-Token": r.get_json()["data"]["csrf_token"]}
+    assert _quota_of(c, h2)["free_tasks"]["total"] == 1000
+
+
+def test_quota_endpoints_require_auth(client):
+    assert client.get("/api/v1/me/quota").status_code == 401
+    assert client.get("/api/v1/plans").status_code == 401
+
+
+def test_plans_catalog(auth):
+    c, h, _ = auth
+    r = c.get("/api/v1/plans", headers=h)
+    assert r.status_code == 200
+    data = r.get_json()["data"]
+    assert data["currency"] == "THB"
+    assert data["payment"] == "OFFLINE"
+    assert [p["code"] for p in data["items"]] == [
+        "KINDER", "STARTER", "INTERMEDIATE", "ADVANCE"
+    ]
+    starter = data["items"][1]
+    assert starter["price"]["monthly_thb"] == 599
+    assert starter["price"]["yearly_thb"] == 5990
+    assert starter["quota_pages_per_month"] == 5000
+    assert starter["seats"] == 2
+    assert data["items"][0]["is_default"] is True
+
+
+def test_job_consumes_and_cancel_refunds(auth, ready_file):
+    c, h, f = ready_file
+    r = c.post("/api/v1/ocr/jobs", json={"file_id": f["id"], "params": {}}, headers=h)
+    assert r.status_code == 201, r.get_json()
+    assert _quota_of(c, h)["free_tasks"]["remaining"] == 999
+
+    # QUEUED 直接取消：未产出结果，返还
+    job_id = r.get_json()["data"]["id"]
+    r = c.post(f"/api/v1/ocr/jobs/{job_id}/cancel", headers=h)
+    assert r.status_code == 200
+    assert _quota_of(c, h)["free_tasks"]["remaining"] == 1000
+
+
+def test_failed_job_refunds(app, auth, ready_file):
+    c, h, f = ready_file
+    r = c.post("/api/v1/ocr/jobs", json={"file_id": f["id"], "params": {}}, headers=h)
+    assert r.status_code == 201, r.get_json()
+    job_id = r.get_json()["data"]["id"]
+    assert _quota_of(c, h)["free_tasks"]["remaining"] == 999
+
+    # 源文件失效 → worker FAILED → 返还
+    from models import File
+    from worker import OcrWorker
+
+    with app.app_context():
+        db.session.get(File, f["id"]).status = "VALIDATING"
+        db.session.commit()
+    OcrWorker(app)._process(job_id)
+    r = c.get(f"/api/v1/ocr/jobs/{job_id}", headers=h)
+    assert r.get_json()["data"]["status"] == "FAILED"
+    assert _quota_of(c, h)["free_tasks"]["remaining"] == 1000
+
+
+def test_quota_exceeded_rejects_job(app, auth, ready_file):
+    c, h, f = ready_file
+    from models import QuotaLedger
+
+    with app.app_context():
+        grant = QuotaLedger.query.filter_by(benefit_code="FIRST_LOGIN").first()
+        assert grant is not None
+        db.session.add(
+            QuotaLedger(
+                workspace_type="PERSONAL",
+                user_id=grant.user_id,
+                entry_type="CONSUME",
+                benefit_code="OCR_TASK",
+                quantity=-1000,
+                job_id="synthetic-burn",
+            )
+        )
+        db.session.commit()
+
+    r = c.post("/api/v1/ocr/jobs", json={"file_id": f["id"], "params": {}}, headers=h)
+    assert r.status_code == 402
+    assert r.get_json()["code"] == "QUOTA_EXCEEDED"
+
+
+def test_enterprise_bonus_separate_ledger(app, auth):
+    c, h, _ = auth
+    ent = _verified_enterprise(app, c, h)
+
+    # 惰性发放：/me/quota 检测到 VERIFIED 即补发企业 1,000 次
+    ws = _quota_of(c, h, "ENTERPRISE")
+    assert ws["enterprise_id"] == ent["id"]
+    assert ws["free_tasks"] == {"total": 1000, "remaining": 1000}
+    # 个人空间与企业空间分开记账
+    assert _quota_of(c, h)["free_tasks"]["remaining"] == 1000
+
+    # 企业空间任务消耗企业额度，不影响个人额度
+    r = c.post(
+        "/api/v1/uploads",
+        headers=h,
+        json={
+            "file_name": "ent.png",
+            "size_bytes": len(PNG_1PX),
+            "workspace_type": "ENTERPRISE",
+            "enterprise_id": ent["id"],
+        },
+    )
+    assert r.status_code == 201, r.get_json()
+    f = r.get_json()["data"]["file"]
+    r = c.put(
+        f"/api/v1/uploads/{f['id']}/content",
+        data=PNG_1PX,
+        headers={"Content-Type": "image/png", **h},
+    )
+    assert r.status_code == 200, r.get_json()
+    r = c.post(f"/api/v1/uploads/{f['id']}/complete", headers=h)
+    assert r.status_code == 200, r.get_json()
+
+    r = c.post("/api/v1/ocr/jobs", json={"file_id": f["id"], "params": {}}, headers=h)
+    assert r.status_code == 201, r.get_json()
+    assert _quota_of(c, h, "ENTERPRISE")["free_tasks"]["remaining"] == 999
+    assert _quota_of(c, h)["free_tasks"]["remaining"] == 1000

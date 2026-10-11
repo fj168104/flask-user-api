@@ -13,8 +13,6 @@ import os
 import re
 import uuid
 
-from pathlib import Path
-
 import httpx
 from flask import Blueprint, current_app, request, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -25,6 +23,7 @@ from extensions import db
 from fileaccess import get_file_for_user
 from models import File
 from workspace import resolve_workspace
+import storage
 
 logger = logging.getLogger(__name__)
 bp = Blueprint("files", __name__)
@@ -41,12 +40,6 @@ _MAGIC = {
     "pdf": (b"%PDF",),
 }
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._\-\u0e00-\u0e7f\u4e00-\u9fff ]+")
-
-
-def _storage_dir() -> Path:
-    d = Path(current_app.config["FILE_STORAGE_DIR"]).resolve()
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
 def _sniff_ext(data: bytes) -> str | None:
@@ -75,9 +68,7 @@ def _reject(f: File, reason_key: str) -> None:
 
 
 def _save_content(f: File, data: bytes, ext: str) -> None:
-    path = _storage_dir() / f"{f.id}.{ext}"
-    path.write_bytes(data)
-    f.storage_path = str(path)
+    f.storage_path = storage.put_bytes("files", f"{f.id}.{ext}", data, _EXT_MIME[ext])
     f.size_bytes = len(data)
     f.sha256 = hashlib.sha256(data).hexdigest()
     f.mime_type = _EXT_MIME[ext]
@@ -166,7 +157,7 @@ def upload_complete(upload_id: str):
     f.status = "VALIDATING"
     db.session.commit()
 
-    data = Path(f.storage_path).read_bytes()
+    data = storage.get_bytes(f.storage_path)
     ext = f.original_name.rsplit(".", 1)[-1].lower()
     try:
         pages = _detect_page_count(ext, data)
@@ -271,61 +262,59 @@ def file_info(file_id: str):
 
 @bp.get("/files/<file_id>/content")
 def file_content(file_id: str):
-    """原件读取/下载；Range 由 send_file(conditional=True) 处理，同样过对象鉴权。"""
+    """原件读取/下载：字节经对象存储取回后由后端代理下发（过对象鉴权，无匿名 URL）。"""
     f = get_file_for_user(file_id, current_user())
     if f.status not in ("READY", "UPLOADED"):
         raise not_found()
-    path = Path(f.storage_path)
-    if not path.exists():
+    if not storage.exists(f.storage_path):
         raise not_found()
     download = request.args.get("download") == "1"
+    data = storage.get_bytes(f.storage_path)
     return send_file(
-        str(path),
+        io.BytesIO(data),
         mimetype=f.mime_type,
         as_attachment=download,
         download_name=f.original_name if download else None,
-        conditional=True,
     )
 
 
 @bp.get("/files/<file_id>/pages/<int:page>/preview")
 def file_page_preview(file_id: str, page: int):
-    """页预览：图片返回本体；PDF 用 PyMuPDF 渲染为 PNG（按文件缓存，鉴权不变）。"""
+    """页预览：图片返回本体；PDF 用 PyMuPDF 渲染为 PNG（对象存储缓存，鉴权不变）。"""
     f = get_file_for_user(file_id, current_user())
     ext = f.original_name.rsplit(".", 1)[-1].lower()
     if f.status not in ("READY", "UPLOADED"):
         raise not_found()
     if ext == "pdf":
         png = _render_pdf_page(f, page)
-        return send_file(png, mimetype="image/png", conditional=True)
+        return send_file(io.BytesIO(png), mimetype="image/png")
     if page != 1:
         raise not_found()
-    return send_file(str(Path(f.storage_path)), mimetype=f.mime_type, conditional=True)
+    if not storage.exists(f.storage_path):
+        raise not_found()
+    return send_file(io.BytesIO(storage.get_bytes(f.storage_path)), mimetype=f.mime_type)
 
 
-def _render_pdf_page(f: File, page: int) -> str:
-    """渲染 PDF 单页为 PNG 并缓存到 <storage>/_previews/<file_id>/page_<n>.png，返回缓存路径。"""
+def _render_pdf_page(f: File, page: int) -> bytes:
+    """渲染 PDF 单页为 PNG；渲染结果按对象存储缓存（key=previews/<file_id>/page_<n>.png）。"""
     import pymupdf
 
-    cache_dir = _storage_dir() / "_previews" / f.id
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cached = cache_dir / f"page_{page}.png"
-    if cached.exists():
-        return str(cached)
-
-    src = Path(f.storage_path)
-    if not src.exists():
+    key = storage.stored_path("previews", f"{f.id}/page_{page}.png")
+    if storage.exists(key):
+        return storage.get_bytes(key)
+    if not storage.exists(f.storage_path):
         raise not_found()
     try:
-        doc = pymupdf.open(str(src))
+        doc = pymupdf.open(stream=storage.get_bytes(f.storage_path), filetype="pdf")
         with doc:
             if page < 1 or page > doc.page_count:
                 raise not_found()
             pix = doc.load_page(page - 1).get_pixmap(matrix=pymupdf.Matrix(2, 2))
-            pix.save(str(cached))
+            png = pix.tobytes("png")
     except pymupdf.FileDataError:
         raise ApiError(400, "INVALID_ARGUMENT", "files.corrupt_or_encrypted")
-    return str(cached)
+    storage.put_bytes("previews", f"{f.id}/page_{page}.png", png, "image/png")
+    return png
 
 
 # ---------- 413 ----------

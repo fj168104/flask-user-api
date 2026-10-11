@@ -103,6 +103,8 @@ class Enterprise(db.Model, TimestampMixin):
     country = db.Column(db.String(8), nullable=False, default="TH")
     legal_name = db.Column(db.String(255), nullable=False, default="")
     registration_no = db.Column(db.String(64), nullable=False, default="")
+    contact_phone = db.Column(db.String(32), nullable=False, default="")
+    cert_file_id = db.Column(db.String(36), db.ForeignKey("files.id"), nullable=True)
     status = db.Column(
         db.String(32), nullable=False, default="PENDING_VERIFICATION"
     )  # PENDING_VERIFICATION / VERIFIED / SUSPENDED / DISABLED
@@ -115,6 +117,9 @@ class Enterprise(db.Model, TimestampMixin):
             "code": self.code,
             "country": self.country,
             "legal_name": self.legal_name,
+            "registration_no": self.registration_no,
+            "contact_phone": self.contact_phone,
+            "cert_file_id": self.cert_file_id,
             "status": self.status,
         }
 
@@ -399,3 +404,30 @@ class ReviewSyncCursor(db.Model):
     source = db.Column(db.String(32), nullable=False, unique=True)
     cursor = db.Column(db.String(128), nullable=False, default="")
     updated_at = db.Column(db.DateTime, nullable=False, default=_now)
+
+
+# ---------- 配额流水（PRD v1.4 §20） ----------
+
+
+class QuotaLedger(db.Model):
+    """赠送/消耗/返还统一记账：工作空间余额 = SUM(quantity)。
+
+    个人空间键 = (PERSONAL, user_id)；企业空间键 = (ENTERPRISE, enterprise_id)。
+    grant_key 唯一约束保证发放幂等（首登赠 / 企业认证赠）；消耗与返还按
+    job_id 关联，返还以「已有 CONSUME 且无 REFUND」幂等防重。
+    """
+
+    __tablename__ = "quota_ledger"
+
+    id = db.Column(_bigint_pk(), primary_key=True, autoincrement=True)
+    grant_key = db.Column(db.String(128), nullable=True, unique=True)
+    workspace_type = db.Column(db.String(16), nullable=False)  # PERSONAL / ENTERPRISE
+    enterprise_id = db.Column(db.BigInteger, nullable=True)
+    user_id = db.Column(db.BigInteger, nullable=True, index=True)
+    entry_type = db.Column(db.String(16), nullable=False)  # GRANT / CONSUME / REFUND
+    benefit_code = db.Column(
+        db.String(32), nullable=False
+    )  # FIRST_LOGIN / FIRST_ENTERPRISE_VERIFIED / OCR_TASK
+    quantity = db.Column(db.Integer, nullable=False)  # 发放/返还为正，消耗为负
+    job_id = db.Column(db.String(36), nullable=True, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=_now)

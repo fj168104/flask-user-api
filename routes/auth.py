@@ -26,6 +26,7 @@ from auth import (
 from errors import ApiError, invalid_argument, ok, service_unavailable
 from extensions import db
 from models import Session, User
+import quota
 from workspace import list_workspaces
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,9 @@ def auth_line():
             if len(dev_id) > 64:
                 raise invalid_argument("error.invalid_argument")
             user = _upsert_line_user("line", f"dev:{dev_id}", dev_id, "", language)
-            return _issue_session_response(user, language)
+            resp = _issue_session_response(user, language)
+            quota.ensure_user_bonus(user.id)  # 首登赠 1,000 次（幂等，失败不阻断登录）
+            return resp
         raise invalid_argument("auth.id_token_required")
 
     claims = _verify_line_id_token(id_token)
@@ -141,7 +144,9 @@ def auth_line():
         str(claims.get("picture") or ""),
         language,
     )
-    return _issue_session_response(user, language)
+    resp = _issue_session_response(user, language)
+    quota.ensure_user_bonus(user.id)
+    return resp
 
 
 @bp.get("/auth/session")

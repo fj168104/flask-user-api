@@ -53,6 +53,12 @@ class Config:
     AUTH_DEV_MODE = _bool("AUTH_DEV_MODE", False)
 
     # ---------- 上传与任务限额（PRD §11） ----------
+    # 对象存储后端（storage.py）：local=本地盘（开发/测试），firebase=Firebase Storage（生产）
+    STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
+    GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "saiflow-509205")
+    FIREBASE_STORAGE_BUCKET = os.getenv(
+        "FIREBASE_STORAGE_BUCKET", "saiflow-509205.firebasestorage.app"
+    )
     FILE_STORAGE_DIR = os.getenv("FILE_STORAGE_DIR", "./storage/files")
     EXPORT_STORAGE_DIR = os.getenv("EXPORT_STORAGE_DIR", "./storage/exports")
     ALLOWED_FILE_EXTENSIONS = {"jpg", "jpeg", "png", "pdf"}

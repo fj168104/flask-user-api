@@ -53,6 +53,8 @@ STATEMENTS = [
         `country`         VARCHAR(8)   NOT NULL DEFAULT 'TH',
         `legal_name`      VARCHAR(255) NOT NULL DEFAULT '',
         `registration_no` VARCHAR(64)  NOT NULL DEFAULT '',
+        `contact_phone`   VARCHAR(32)  NOT NULL DEFAULT '',
+        `cert_file_id`    VARCHAR(36)  NULL DEFAULT NULL,
         `status`          VARCHAR(32)  NOT NULL DEFAULT 'PENDING_VERIFICATION',
         `external_ref`    VARCHAR(64)  NOT NULL DEFAULT '',
         `policy_version`  INT          NOT NULL DEFAULT 1,
@@ -62,6 +64,10 @@ STATEMENTS = [
         UNIQUE KEY `uq_enterprises_code` (`code`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
+    # 已有库升级（db.create_all 不会改表结构，需手动执行一次）：
+    # ALTER TABLE `sai-flow`.`enterprises`
+    #     ADD COLUMN `contact_phone` VARCHAR(32) NOT NULL DEFAULT '' AFTER `registration_no`,
+    #     ADD COLUMN `cert_file_id` VARCHAR(36) NULL DEFAULT NULL AFTER `contact_phone`;
     """
     CREATE TABLE `sai-flow`.`memberships` (
         `id`            BIGINT      NOT NULL AUTO_INCREMENT,

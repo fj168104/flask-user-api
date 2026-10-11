@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from flask import Flask
@@ -44,6 +43,7 @@ class OcrWorker:
 
         from extensions import db
         from models import OcrJob
+        import quota
 
         with self.app.app_context():
             # 重启恢复：中断的任务重新入队；已请求取消的直接落终态（不再计费）
@@ -57,6 +57,7 @@ class OcrWorker:
             for job in cancelling:
                 job.status = "CANCELLED"
                 job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                quota.refund_for_job(job.id)
             db.session.commit()
 
         while not self._stop.is_set():
@@ -79,6 +80,7 @@ class OcrWorker:
                     error_code: str = "", error_message: str = "") -> None:
         from extensions import db
         from models import OcrJob
+        import quota
 
         job = db.session.get(OcrJob, job_id)
         if job is None:
@@ -90,6 +92,12 @@ class OcrWorker:
             job.error_code = error_code
         if error_message:
             job.error_message = error_message[:512]
+        if status in ("FAILED", "CANCELLED"):
+            # 未产出可用结果：返还本次免费任务消耗（幂等）
+            try:
+                quota.refund_for_job(job_id)
+            except Exception:  # noqa: BLE001 返还不阻塞状态落库
+                logger.exception("配额返还失败 job=%s", job_id)
         db.session.commit()
 
     def _cancel_requested(self, job_id: str) -> bool:
@@ -130,8 +138,9 @@ class OcrWorker:
             self._transition(job_id, "FAILED", error_code="FILE_NOT_READY",
                              error_message="source file missing or not READY")
             return
-        path = Path(file.storage_path)
-        if not path.exists():
+        import storage
+
+        if not storage.exists(file.storage_path):
             self._transition(job_id, "FAILED", error_code="FILE_MISSING",
                              error_message="source file bytes missing")
             return
@@ -144,7 +153,7 @@ class OcrWorker:
 
         self._transition(job_id, "PROCESSING", progress=30)
 
-        content = path.read_bytes()
+        content = storage.get_bytes(file.storage_path)
         params = dict(job.params or {})
         field_names = params.pop("field_names", None)
         started = time.monotonic()
@@ -221,13 +230,23 @@ class OcrWorker:
 
         # 审计副本 + 完成通知
         try:
-            from textin.adapter import persist_raw_audit_copy
+            import json
+            from datetime import datetime, timezone
 
-            persist_raw_audit_copy(
-                self.app.config["OCR_STORAGE_DIR"], job_id,
-                {"summary": {k: result[k] for k in
-                             ("page_count", "table_count", "field_count", "missing_pages",
-                              "duration_ms", "field_source", "vendor")}},
+            storage.put_bytes(
+                "audit",
+                f"{job_id}.json",
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "saved_at": datetime.now(timezone.utc).isoformat(),
+                        "summary": {k: result[k] for k in
+                                    ("page_count", "table_count", "field_count", "missing_pages",
+                                     "duration_ms", "field_source", "vendor")},
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                "application/json",
             )
         except Exception:  # noqa: BLE001
             logger.warning("审计副本写入失败 job=%s", job_id)

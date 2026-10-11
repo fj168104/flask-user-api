@@ -102,6 +102,10 @@ def state_conflict(message_key: str = "error.state_conflict") -> ApiError:
     return ApiError(409, "STATE_CONFLICT", message_key)
 
 
+def quota_exceeded() -> ApiError:
+    return ApiError(402, "QUOTA_EXCEEDED", "quota.exceeded")
+
+
 def version_conflict() -> ApiError:
     return ApiError(409, "VERSION_CONFLICT", "error.version_conflict")
 
