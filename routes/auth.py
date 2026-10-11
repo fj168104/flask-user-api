@@ -96,10 +96,14 @@ def _verify_line_id_token(id_token: str) -> dict:
             "AUTH_SERVICE_UNAVAILABLE", "auth.line_verify_unavailable"
         )
     if resp.status_code != 200:
+        logger.warning("LINE verify failed: status=%s body=%s", resp.status_code, resp.text[:300])
         raise ApiError(401, "AUTH_REQUIRED", "auth.line_token_invalid")
     claims = resp.json()
     now = int(datetime.now(timezone.utc).timestamp())
     if claims.get("iss") != LINE_ISSUER:
+        logger.warning(
+            "LINE verify iss mismatch: iss=%r aud=%r", claims.get("iss"), claims.get("aud")
+        )
         raise ApiError(401, "AUTH_REQUIRED", "auth.line_token_invalid")
     aud = claims.get("aud")
     if aud != channel_id and channel_id not in (
