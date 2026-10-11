@@ -16,8 +16,8 @@ RUN pip install --no-cache-dir \
     --timeout 120 --retries 5 \
     -r requirements.txt
 
-# 复制应用代码
-COPY app.py config.py extensions.py models.py auth.py errors.py fileaccess.py middleware.py worker.py workspace.py ./
+# 复制应用代码（根目录模块白名单；storage.py 对象存储抽象、quota.py 配额流水、plans.py 套餐目录）
+COPY app.py config.py extensions.py models.py auth.py errors.py fileaccess.py middleware.py worker.py workspace.py storage.py quota.py plans.py ./
 COPY routes ./routes
 # TextIn OCR provider（唯一厂商，PRD §12）
 COPY textin ./textin
